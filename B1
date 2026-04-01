@@ -1,0 +1,108 @@
+import cv2
+import numpy as np
+from djitellopy import Tello
+
+tello = Tello()
+tello.connect()
+windowTitle = "Tello drone video stream"
+
+"""global variables"""
+color = 100                  # initial H value (hue)
+lo = np.array([color - 5, 100, 50])
+hi = np.array([color + 5, 255, 255])
+color_info = (0, 255, 255)   # display color (BGR)
+
+image = None                 # used in the loop (initial value)
+
+
+def mouse(event, x, y, flags, param):
+    """detects mouse actions"""
+    
+    global lo, hi, color, image
+
+    # Left click: pick the pixel color (hue)
+    if event == cv2.EVENT_LBUTTONDOWN and image is not None:
+        color = int(image[y, x][0])
+
+    # Scroll wheel: increase/decrease hue value
+    if event == cv2.EVENT_MOUSEWHEEL:
+        if flags < 0:        # scroll down
+            if color > 5:
+                color -= 1
+        else:                # scroll up
+            if color < 250:
+                color += 1
+
+    # Update HSV bounds
+    lo[:] = [color - 5, 100, 50]
+    hi[:] = [color + 5, 255, 255]
+
+
+"""video stream initialization"""
+
+cap = tello.streamon()
+
+cv2.namedWindow(windowTitle)
+cv2.setMouseCallback(windowTitle, mouse)
+
+img = tello.get_frame_read().frame  # frames from the drone camera
+height, width = img.shape[:2]
+
+# Compute image center coordinates
+image_center_x = width // 2
+image_center_y = height // 2
+
+
+while True:
+    frame = tello.get_frame_read().frame  # read frames from the drone camera
+
+    """image processing"""
+
+    # BGR -> HSV conversion
+    image = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    image = cv2.blur(image, (5, 5))
+
+    # Color mask
+    mask = cv2.inRange(image, lo, hi)
+    mask = cv2.erode(mask, None, iterations=1)
+    mask = cv2.dilate(mask, None, iterations=1)
+
+    # Filtered image (black & white)
+    image2 = cv2.bitwise_and(frame, frame, mask=mask)
+
+    """object detection"""
+
+    elements = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE)[-2]
+
+    if len(elements) > 0:
+        c = max(elements, key=cv2.contourArea)
+        ((x, y), radius) = cv2.minEnclosingCircle(c)
+
+        if radius > 30:  # filter out noise (prevents detecting small artifacts)
+            # circle around the object
+            cv2.circle(frame, (int(x), int(y)), int(radius), color_info, 2)
+
+    error_x = int(x) - image_center_x
+    error_y = int(y) - image_center_y
+    info_text = "Pos: ({}, {}) Size: {}".format(error_x, error_y, int(radius))
+
+    # Display hue value and battery level
+    cv2.putText(frame, "Color: {}".format(color),
+                (10, 30), cv2.FONT_HERSHEY_DUPLEX,
+                1, color_info, 1, cv2.LINE_AA)
+    cv2.putText(frame, "battery lvl:{}%".format(tello.get_battery()), (width - 300, 50), cv2.FONT_HERSHEY_DUPLEX, 1, (0, 0, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, info_text, (10, height - 10),
+                cv2.FONT_HERSHEY_DUPLEX, 0.8, color_info, 1, cv2.LINE_AA)
+
+    """display masks and camera feed"""
+
+    cv2.imshow(windowTitle, frame)
+
+    # exit on 'q' key press
+    if cv2.waitKey(1) == ord('q'):
+        break
+
+# stop the drone and close all windows
+tello.end()
+cv2.destroyAllWindows()
