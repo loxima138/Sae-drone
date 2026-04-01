@@ -1,0 +1,237 @@
+from djitellopy import Tello
+import cv2
+import numpy as np
+import time
+
+def mouse(event, x, y, flags, param):
+    global color, lo, hi, hsv_image
+
+    if hsv_image is None:
+        return
+
+    # Left click: pick the pixel hue
+    if event == cv2.EVENT_LBUTTONDOWN:
+        color = int(hsv_image[y, x][0])
+
+    # Scroll wheel: adjust hue
+    if event == cv2.EVENT_MOUSEWHEEL:
+        if flags < 0:
+            if color > 5:
+                color -= 1
+        else:
+            if color < 250:
+                color += 1
+
+    lo[:] = [max(color - 5, 0), 100, 50]
+    hi[:] = [min(color + 5, 179), 255, 255]  # H in OpenCV HSV is [0..179]
+
+
+tello = Tello()
+tello.connect()
+tello.streamon()
+frame_read = tello.get_frame_read()
+
+windowTitle = "Tello - Arc trajectory around a target"
+cv2.namedWindow(windowTitle)
+cv2.setMouseCallback(windowTitle, mouse)
+
+airborne = False
+
+# Color detection
+color = 100
+lo = np.array([max(color - 5, 0), 100, 50], dtype=np.uint8)
+hi = np.array([min(color + 5, 179), 255, 255], dtype=np.uint8)
+color_info = (0, 255, 255)
+hsv_image = None
+
+Kp = 0.17
+yaw_max = 60
+
+trajectory_mode = False
+trajectory_direction = 1         # 1 = right, -1 = left
+lateral_speed = 20               # lateral speed
+direction_change_delay = 7000    # delay in milliseconds
+start_tick = 0
+
+# Stop control if target is lost
+last_target_seen = time.time()
+target_timeout = 0.6             # seconds
+
+
+while True:
+    frame = frame_read.frame
+    if frame is None:
+        continue
+
+    height, width = frame.shape[:2]
+    cx = width // 2
+    cy = height // 2
+
+    # HSV processing + mask
+    hsv_image = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv_image = cv2.blur(hsv_image, (5, 5))
+
+    mask = cv2.inRange(hsv_image, lo, hi)
+    mask = cv2.erode(mask, None, iterations=1)
+    mask = cv2.dilate(mask, None, iterations=1)
+
+    elements = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+
+    # Display crosshair and overlay
+    cv2.line(frame, (cx, 0), (cx, height), (255, 0, 0), 2)
+    cv2.putText(frame, f"Kp = {Kp:.2f}", (10, 35), cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, f"Color(H) = {color}", (10, 70), cv2.FONT_HERSHEY_DUPLEX, 0.7, color_info, 2)
+
+    try:
+        bat = tello.get_battery()
+        cv2.putText(frame, f"Battery: {bat}%", (width - 250, height - 20),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
+    except:
+        pass
+
+    yaw_cmd = 0
+    target_found = False
+    error = 0
+    radius = 0
+    x_obj, y_obj = None, None
+
+    if len(elements) > 0:
+        c = max(elements, key=cv2.contourArea)
+        ((x, y), radius) = cv2.minEnclosingCircle(c)
+
+        if radius > 30:
+            target_found = True
+            x_obj, y_obj = int(x), int(y)
+            last_target_seen = time.time()
+
+            cv2.circle(frame, (x_obj, y_obj), int(radius), color_info, 2)
+            cv2.circle(frame, (x_obj, y_obj), 5, (0, 0, 255), -1)
+
+            # Compute error and proportional yaw command
+            error = x_obj - cx
+            yaw_cmd = int(np.clip(Kp * error, -yaw_max, yaw_max))
+
+            cv2.putText(frame, f"Error = {error:+d} px", (10, 110),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, f"Yaw cmd = {yaw_cmd:+d}", (10, 150),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
+
+    if trajectory_mode:
+        direction_text = "RIGHT" if trajectory_direction == 1 else "LEFT"
+        cv2.putText(frame, f"Trajectory Mode: {direction_text}", (10, height - 60),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Delay: {direction_change_delay} ms | Vlat: {lateral_speed}", (10, height - 25),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 255, 0), 2)
+
+    cv2.imshow(windowTitle, frame)
+
+    key = cv2.waitKey(1) & 0xff
+    if key == 27:   # Escape: exit
+        break
+
+    # Take off / land
+    if key == ord('t'):
+        tello.takeoff()
+        airborne = True
+        tello.send_rc_control(0, 0, 0, 0)
+    if key == ord('l'):
+        trajectory_mode = False
+        tello.send_rc_control(0, 0, 0, 0)
+        tello.land()
+        airborne = False
+
+    # Gain adjustment
+    if key in (ord('+'), ord('=')):
+        Kp += 0.01
+        print(f"Kp increased: {Kp:.2f}")
+    if key in (ord('-'), ord('_')):
+        Kp = max(0.01, Kp - 0.01)
+        print(f"Kp decreased: {Kp:.2f}")
+
+    # Delay adjustment
+    if key == ord('['):
+        direction_change_delay = max(1000, direction_change_delay - 500)
+        print(f"Direction change delay: {direction_change_delay} ms")
+    if key == ord(']'):
+        direction_change_delay = min(20000, direction_change_delay + 500)
+        print(f"Direction change delay: {direction_change_delay} ms")
+
+    # Lateral speed adjustment
+    if key == ord(','):
+        lateral_speed = max(5, lateral_speed - 2)
+        print(f"Speed: {lateral_speed}")
+    if key == ord('.'):
+        lateral_speed = min(60, lateral_speed + 2)
+        print(f"Speed: {lateral_speed}")
+
+    # Enable / disable trajectory mode
+    if key == ord('o') and airborne:
+        trajectory_mode = not trajectory_mode
+        start_tick = cv2.getTickCount()
+        trajectory_direction = 1
+        print("trajectory:", "on" if trajectory_mode else "off")
+        if not trajectory_mode:
+            tello.send_rc_control(0, 0, 0, 0)
+
+    if not airborne:
+        continue
+
+    if trajectory_mode:
+        # Target lost: stop all movement
+        if (time.time() - last_target_seen) > target_timeout:
+            tello.send_rc_control(0, 0, 0, 0)
+            cv2.putText(frame, "target lost", (10, 200),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 2)
+            # optionally disable trajectory mode automatically
+            trajectory_mode = False
+            continue
+
+        # Handle direction change timing
+        current_tick = cv2.getTickCount()
+        elapsed_ms = ((current_tick - start_tick) / cv2.getTickFrequency()) * 1000
+
+        if elapsed_ms >= direction_change_delay:
+            trajectory_direction = -trajectory_direction
+            start_tick = cv2.getTickCount()
+            print("right" if trajectory_direction == 1 else "left")
+
+        # Arc motion: lateral movement + proportional yaw correction
+        vy = trajectory_direction * lateral_speed  # left/right
+        vx = 0                                     # no forward movement
+        vz = 0
+        tello.send_rc_control(vy, vx, vz, yaw_cmd)
+
+    else:
+        # Manual control
+        vx, vy, vz, yaw = 0, 0, 0, 0
+
+        if key == ord('z'):
+            vx = 50     # move forward
+        elif key == ord('s'):
+            vx = -50    # move backward
+        elif key == ord('d'):
+            vy = 50     # move right
+        elif key == ord('a'):
+            vy = -50    # move left
+        elif key == ord('e'):
+            yaw = 50    # rotate clockwise
+        elif key == ord('w'):
+            yaw = -50   # rotate counter-clockwise
+        elif key == ord('c'):
+            vz = 50     # move up
+        elif key == ord('x'):
+            vz = -50    # move down
+
+        tello.send_rc_control(vy, vx, vz, yaw)  # send commands to the drone
+
+    # Close on window exit
+    if cv2.getWindowProperty(windowTitle, cv2.WND_PROP_VISIBLE) < 1:
+        if airborne:
+            tello.send_rc_control(0, 0, 0, 0)
+            tello.land()
+        break
+
+# Cleanup
+tello.streamoff()
+tello.end()
+cv2.destroyAllWindows()
