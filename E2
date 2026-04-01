@@ -1,0 +1,347 @@
+from djitellopy import Tello
+import cv2
+import numpy as np
+
+
+tello = Tello()
+tello.connect()
+tello.streamon()
+frame_read = tello.get_frame_read()
+
+windowTitle = "Tello drone video stream"
+airborne = False          # flight state variable
+
+img = frame_read.frame
+
+cv2.namedWindow(windowTitle)
+cv2.resizeWindow(windowTitle, 960, 720)
+
+cv2.namedWindow('Track')
+cv2.resizeWindow('Track', 600, 200)
+
+def track(x): pass      # empty callback required for trackbars
+
+# Trackbar creation
+cv2.createTrackbar('Kp L/R', 'Track', 15, 100, track)
+cv2.createTrackbar('Kp U/D', 'Track', 10, 100, track)
+cv2.createTrackbar('Kp F/B', 'Track', 17, 100, track)
+
+# State machine constants
+STATE_IDLE     = 1
+STATE_TAKEOFF  = 2
+STATE_FRONT    = 3
+STATE_ROTATE   = 4
+STATE_BEHIND   = 5
+STATE_HOOP     = 6
+STATE_LAND     = 7
+
+current_state = STATE_IDLE
+
+# Timing variables
+t0     = 0    # start time of current state
+chrono = 0.0  # elapsed time in current state
+
+# Visual control variables
+target_radius   = 250  # desired circle size
+pos_tolerance   = 35   # X,Y position tolerance
+radius_tolerance = 20  # radius tolerance
+
+# Command variables
+error_x, error_y, error_r = 0.0, 0.0, 0.0
+cmd_rot, cmd_alt, cmd_dist = 0, 0, 0
+
+# HSV color variables
+color = 30                      # yellow hue
+lo = np.array([20, 100, 100])
+hi = np.array([30, 255, 255])
+color_circle_dot = (0, 255, 255)
+
+
+def mouse(event, x, y, flags, param):
+
+    global lo, hi, color, image
+    if event == cv2.EVENT_LBUTTONDBLCLK:
+        # pick pixel hue on double-click
+        color = image[y, x][0]
+    if event == cv2.EVENT_MOUSEWHEEL:
+        # scroll wheel: adjust hue
+        if flags < 0:
+            if color > 0: color -= 1
+        else:
+            if color < 179: color += 1
+    # Update HSV thresholds
+    lo[0] = max(0, color - 10)
+    hi[0] = min(179, color + 10)
+
+def computePositionCommands():
+
+    global cmd_rot, cmd_alt, cmd_dist
+
+    # Read gains from trackbars
+    Klr = cv2.getTrackbarPos('Kp L/R', 'Track') / 100.0
+    Kud = cv2.getTrackbarPos('Kp U/D', 'Track') / 100.0
+    Kfb = cv2.getTrackbarPos('Kp F/B', 'Track') / 100.0
+
+    # Compute proportional commands
+    cmd_rot  = int(Klr * error_x)   # left/right rotation
+    cmd_alt  = int(Kud * error_y)   # altitude up/down
+    cmd_dist = int(Kfb * error_r)   # distance forward/backward
+
+    # Clamp commands (Tello limits: -100 to +100)
+    cmd_rot  = max(min(cmd_rot,  100), -100)
+    cmd_alt  = max(min(cmd_alt,  100), -100)
+    cmd_dist = max(min(cmd_dist, 100), -100)
+
+    # Return with rotation inversion for correction
+    return -cmd_rot, cmd_dist, cmd_alt
+
+def positionSatisfied():
+    return (abs(error_x) < pos_tolerance and
+            abs(error_y) < pos_tolerance and
+            abs(error_r) < radius_tolerance)
+
+def getChrono():
+    if t0 == 0:
+        return 0.0
+    return (cv2.getTickCount() - t0) / cv2.getTickFrequency()
+
+print("Program started. Press SPACE to take off.")
+
+while True:
+
+    frame = frame_read.frame
+    height, width, _ = frame.shape
+    center_x = width // 2
+    center_y = height // 2
+
+    # Convert to HSV and apply color mask
+    image = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(image, lo, hi)
+
+    # Morphological operations to clean the mask
+    mask = cv2.erode(mask, None, iterations=4)
+    mask = cv2.dilate(mask, None, iterations=4)
+
+    # Contour detection
+    elements = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+
+    # Reset detection variables
+    error_x, error_y, error_r = 0.0, 0.0, 0.0
+    target_found = False
+    x_obj, y_obj, obj_radius = 0, 0, 0
+
+    # If at least one contour detected
+    if len(elements) > 0:
+        # Select the largest contour
+        c = max(elements, key=cv2.contourArea)
+        ((x_obj, y_obj), obj_radius) = cv2.minEnclosingCircle(c)
+
+        # Filter: minimum radius to discard noise
+        if obj_radius > 15:
+            target_found = True
+
+            # Draw detected circle and its center
+            cv2.circle(frame, (int(x_obj), int(y_obj)), int(obj_radius),
+                       color_circle_dot, 2)
+            cv2.circle(frame, (int(x_obj), int(y_obj)), 5,
+                       color_circle_dot, -1)
+
+            # Compute errors relative to image center
+            error_x = center_x - int(x_obj)      # horizontal error
+            error_y = center_y - int(y_obj)       # vertical error
+            error_r = target_radius - int(obj_radius)  # distance error
+
+    state_msg = ""          # state message for display
+    chrono = getChrono()    # elapsed time in current state
+
+    # Initialize RC commands to 0
+    rc_lr, rc_fb, rc_ud, rc_y = 0, 0, 0, 0
+
+    # 1. idle
+    if current_state == STATE_IDLE:
+        state_msg = "1. on ground (Space)"
+
+    # 2. take off
+    elif current_state == STATE_TAKEOFF:
+        state_msg = f"2. taking off ({chrono:.1f}s)"
+
+        if not airborne:
+            print("Taking off...")
+            tello.takeoff()
+            airborne = True
+            t0 = cv2.getTickCount()  # start timer
+
+        # Transition: timed delay
+        if chrono > 4.0:
+            print("Takeoff complete, moving to front position")
+            current_state = STATE_FRONT
+            t0 = cv2.getTickCount()  # reset timer
+
+    # 3. in front of cone
+    elif current_state == STATE_FRONT:
+        state_msg = f"3. positioning in front ({chrono:.1f}s)"
+
+        # Visual control if object detected
+        if target_found:
+            rc_y, rc_fb, rc_ud = computePositionCommands()
+
+        # Transition: position satisfied or timeout
+        if positionSatisfied() or chrono > 12:
+            if positionSatisfied():
+                print("Front position validated (target locked)")
+            else:
+                print("Front position - timeout")
+            current_state = STATE_ROTATE
+            t0 = cv2.getTickCount()
+
+    # 4. rotation
+    elif current_state == STATE_ROTATE:
+        state_msg = f"4. orbit rotation ({chrono:.1f}s)"
+
+        # Orbit phase
+        if chrono < 20.0:
+            # Lateral movement + compensatory rotation to keep cone centered
+            if target_found:
+                computePositionCommands()  # update cmd_rot
+                rot = max(min(int(cmd_rot), 85), -85)  # safety clamp
+                tello.send_rc_control(25, 0, 0, -rot)  # lateral right + rotation
+            else:
+                # If target lost, continue lateral movement without rotation
+                tello.send_rc_control(25, 0, 0, 0)
+
+        # Stabilization phase
+        elif chrono < 23.0:
+            if target_found:
+                rc_y, rc_fb, rc_ud = computePositionCommands()
+                tello.send_rc_control(0, rc_fb, rc_ud, rc_y)
+            else:
+                tello.send_rc_control(0, 0, 0, 0)
+
+        # Transition: end of orbit
+        else:
+            print("Rotation complete, moving to rear position")
+            current_state = STATE_BEHIND
+            t0 = cv2.getTickCount()
+
+    # 5. behind cone
+    elif current_state == STATE_BEHIND:
+        state_msg = f"5. positioning behind ({chrono:.1f}s)"
+
+        # Visual control
+        if target_found:
+            rc_y, rc_fb, rc_ud = computePositionCommands()
+
+        # Transition: position satisfied or timeout
+        if positionSatisfied() or chrono > 10.0:
+            if positionSatisfied():
+                print("Rear position validated (target locked)")
+            else:
+                print("Rear position - timeout")
+            current_state = STATE_HOOP
+            t0 = cv2.getTickCount()
+
+    # 6. hoop
+    elif current_state == STATE_HOOP:
+        state_msg = f"6. hoop ({chrono:.1f}s)"
+
+        # Move forward while climbing slightly
+        rc_fb = 40   # move forward
+        rc_ud = 30   # climb slightly
+
+        # Transition
+        if chrono > 2.5:
+            print("Hoop cleared, landing")
+            current_state = STATE_LAND
+            t0 = 0
+
+    # 7. landing
+    elif current_state == STATE_LAND:
+        state_msg = "7. landing"
+
+        print("Landing...")
+        tello.land()
+        airborne = False
+
+        # Reset to initial state
+        current_state = STATE_IDLE
+        t0 = 0
+
+    # Send RC commands only if:
+    # - drone is airborne
+    # - not in a state that manages its own commands
+    # - not taking off or landing
+    if (airborne and
+        current_state != STATE_ROTATE and
+        current_state not in [STATE_TAKEOFF, STATE_LAND]):
+        tello.send_rc_control(rc_lr, rc_fb, rc_ud, rc_y)
+
+    # Display current state
+    cv2.putText(frame, state_msg, (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
+
+    # Display battery level
+    battery = tello.get_battery()
+    bat_color = (0, 255, 0) if battery > 30 else (0, 0, 255)
+    cv2.putText(frame, f"Battery: {battery}%", (width - 200, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, bat_color, 1)
+
+    # Display errors in debug mode
+    if target_found:
+        cv2.putText(frame, f"Err X:{error_x:.0f} Y:{error_y:.0f} R:{error_r:.0f}",
+                    (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+    # Target lock indicator
+    if target_found and current_state in [STATE_FRONT, STATE_BEHIND]:
+        if positionSatisfied():
+            cv2.putText(frame, "*** Target locked ***", (width // 2 - 150, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 1)
+
+    # Center reference crosshair
+    cv2.line(frame, (0, center_y), (width, center_y), (255, 0, 0), 1)
+    cv2.line(frame, (center_x, 0), (center_x, height), (255, 0, 0), 1)
+
+    # Display main frame
+    cv2.imshow(windowTitle, frame)
+
+    # Display mask (useful for debugging color detection)
+    cv2.imshow('Mask', mask)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    # Exit
+    if key == 27:
+        if airborne:
+            tello.land()
+        break
+
+    # Start autonomous flight or emergency landing
+    elif key == ord(' '):
+        if current_state == STATE_IDLE:
+            print("Starting autonomous flight")
+            current_state = STATE_TAKEOFF
+        else:
+            current_state = STATE_LAND
+
+    # Manual controls
+    elif key == ord('m'):  # move left
+        tello.send_rc_control(-50, 0, 0, 0)
+    elif key == ord('k'):  # move right
+        tello.send_rc_control(50, 0, 0, 0)
+    elif key == ord('o'):  # move forward
+        tello.send_rc_control(0, 50, 0, 0)
+    elif key == ord('l'):  # move backward
+        tello.send_rc_control(0, -50, 0, 0)
+    elif key == ord('w'):  # move up
+        tello.send_rc_control(0, 0, 50, 0)
+    elif key == ord('x'):  # move down
+        tello.send_rc_control(0, 0, -50, 0)
+    elif key == ord('q'):  # rotate left
+        tello.send_rc_control(0, 0, 0, -50)
+    elif key == ord('s'):  # rotate right
+        tello.send_rc_control(0, 0, 0, 50)
+
+    cv2.setMouseCallback(windowTitle, mouse)
+
+tello.streamoff()
+cv2.destroyAllWindows()
+tello.end()
