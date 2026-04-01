@@ -1,0 +1,67 @@
+import cv2
+import numpy as np
+from djitellopy import Tello
+
+tello = Tello()
+tello.connect()
+windowTitle = "Tello drone video stream"
+
+"""global variables"""
+color = 100                  # initial H value (hue)
+lo = np.array([color - 5, 100, 50])
+hi = np.array([color + 5, 255, 255])
+color_info = (0, 255, 255)   # display color (BGR)
+
+image = None                 # used in the loop (initial value)
+
+
+"""video stream initialization"""
+
+cap = tello.streamon()    # turn on the camera
+
+cv2.namedWindow(windowTitle)
+cv2.setMouseCallback(windowTitle)
+
+img = tello.get_frame_read().frame  # frames from the drone camera
+height, width = img.shape[:2]       # resolution
+
+while True:
+    frame = tello.get_frame_read().frame  # read frames from the drone camera
+
+    cv2.imshow(windowTitle, frame)
+
+    key = cv2.waitKey(1) & 0xff
+    if key == 27:   # Escape: exit
+        break
+    vx, vy, vz, yaw = 0, 0, 0, 0
+
+    if key == ord('t'):    # take off
+        tello.takeoff()
+    elif key == ord('l'):  # land
+        tello.land()
+
+    elif key == ord('z'):
+        vx = 100   # move forward
+    elif key == ord('s'):
+        vx = -100  # move backward
+
+    elif key == ord('q'):
+        vy = -100  # move left
+    elif key == ord('d'):
+        vy = 100   # move right
+
+    elif key == ord('e'):
+        yaw = 100  # rotate clockwise
+    elif key == ord('a'):
+        yaw = -100 # rotate counter-clockwise
+
+    elif key == ord('r'):
+        vz = 100   # move up
+    elif key == ord('f'):
+        vz = -100  # move down
+
+    tello.send_rc_control(vy, vx, vz, yaw)  # send commands to the drone
+
+# stop the drone and close all windows
+tello.end()
+cv2.destroyAllWindows()
