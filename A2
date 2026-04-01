@@ -1,0 +1,44 @@
+# connect to your drone's WiFi network: Tello-XXXXXX
+# then run the following code
+
+from djitellopy import Tello
+import cv2
+
+""" drone connection, video stream and initialization """
+tello = Tello()
+tello.connect()
+tello.streamon()
+frame_read = tello.get_frame_read()
+
+windowTitle = "Tello drone video stream"
+airborne = False  # drone is on the ground
+
+img = frame_read.frame          # read frames
+height, width = img.shape[:2]   # retrieve image height and width
+
+while True:
+    img = frame_read.frame  # store current frame in img
+    # display image resolution
+    cv2.putText(img, "Image size is {}x{}.".format(width, height), (10, height - 20), cv2.FONT_HERSHEY_DUPLEX, 1, (255, 255, 255), 1, cv2.LINE_AA)
+    # display battery level
+    cv2.putText(img, "battery lvl:{}%".format(tello.get_battery()), (width - 300, 50), cv2.FONT_HERSHEY_DUPLEX, 1, (0, 0, 255), 1, cv2.LINE_AA)
+    # display the drone feed with the window title
+    cv2.imshow(windowTitle, img)
+
+    key = cv2.waitKey(1) & 0xFF  # wait for a key press
+
+    if key == 27:   # if Escape, shut everything down
+        break
+    elif key == 32:  # if Space, take off or land
+        if airborne:
+            tello.land()     # land the drone if it is airborne
+        else:
+            tello.takeoff()  # take off if the drone is on the ground
+        airborne = not airborne  # toggle airborne state
+
+    if cv2.getWindowProperty(windowTitle, cv2.WND_PROP_VISIBLE) < 1:
+        break
+
+tello.streamoff()         # stop the camera stream
+cv2.destroyAllWindows()   # close all windows
+tello.end()               # land the drone and reset to initial state
