@@ -1,0 +1,235 @@
+import cv2
+import numpy as np
+from djitellopy import Tello
+
+tello = Tello()
+tello.connect()
+tello.streamon()
+frame_read = tello.get_frame_read()
+
+windowTitle = "Tello drone video stream"
+gainsWindow = "Proportional gains tuning"
+
+color = 100
+lo = np.array([color - 5, 100, 50])
+hi = np.array([color + 5, 255, 255])
+color_info = (0, 255, 255)
+hsv_image = None
+
+# Proportional gains (adjustable via trackbars)
+klr = 0.10  # Left/Right gain (Yaw - rotation)
+kud = 0.10  # Up/Down gain
+kfb = 0.10  # Forward/Backward gain
+
+# Setpoints
+target_radius = 150  # target radius in pixels
+detection_threshold = 30  # detection threshold
+
+# Control state
+control_active = False
+airborne = False
+
+def computePositionCommands(errors):
+
+    global klr, kud, kfb
+
+    ex, ey, er = errors
+
+    # Yaw command (left/right rotation) based on ex
+    cmd_yaw = klr * ex
+
+    # Up/down command based on ey
+    # positive ey = object is below => move up (positive)
+    cmd_ud = -kud * ey  # inverted because image Y axis is flipped
+
+    # Forward/backward command based on er
+    # positive er = object too large => move backward (negative)
+    cmd_fb = -kfb * er
+
+    return [cmd_yaw, cmd_ud, cmd_fb]
+
+def clamp(v, vmin=-100, vmax=100):
+    return int(max(vmin, min(vmax, v)))
+
+def mouse(event, x, y, flags, param):
+    global lo, hi, color, hsv_image
+
+    if event == cv2.EVENT_LBUTTONDOWN and hsv_image is not None:
+        color = int(hsv_image[y, x][0])
+
+    if event == cv2.EVENT_MOUSEWHEEL:
+        if flags < 0:
+            if color > 5:
+                color -= 1
+        else:
+            if color < 250:
+                color += 1
+
+    lo[:] = [max(0, color - 5), 100, 50]
+    hi[:] = [min(255, color + 5), 255, 255]
+
+def nothing(x):
+    pass
+
+cv2.namedWindow(windowTitle)
+cv2.setMouseCallback(windowTitle, mouse)
+
+cv2.namedWindow(gainsWindow, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(gainsWindow, 520, 160)
+
+slider = 15  # 0.10 * 100 (but actually 0.15, kept as-is from original)
+
+cv2.createTrackbar("Kp L/R", gainsWindow, slider, 100, nothing)
+cv2.createTrackbar("Kp U/D", gainsWindow, slider, 100, nothing)
+cv2.createTrackbar("Kp F/B", gainsWindow, slider, 100, nothing)
+
+while True:
+    frame = frame_read.frame
+    if frame is None:
+        continue
+
+    height, width = frame.shape[:2]
+    cx, cy = width // 2, height // 2
+
+    # Read gains from trackbars
+    s_lr = cv2.getTrackbarPos("Kp L/R", gainsWindow)
+    s_ud = cv2.getTrackbarPos("Kp U/D", gainsWindow)
+    s_fb = cv2.getTrackbarPos("Kp F/B", gainsWindow)
+
+    klr = s_lr / 100.0
+    kud = s_ud / 100.0
+    kfb = s_fb / 100.0
+
+    hsv_image = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv_image = cv2.blur(hsv_image, (5, 5))
+
+    mask = cv2.inRange(hsv_image, lo, hi)
+    mask = cv2.erode(mask, None, iterations=1)
+    mask = cv2.dilate(mask, None, iterations=1)
+
+    elements = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+
+    target_found = False
+    ex, ey, er = 0, 0, 0
+    x_obj, y_obj, radius = 0, 0, 0
+    cmd_yaw, cmd_ud, cmd_fb = 0, 0, 0
+
+    if len(elements) > 0:
+        c = max(elements, key=cv2.contourArea)
+        ((x, y), radius) = cv2.minEnclosingCircle(c)
+
+        if radius > detection_threshold:
+            target_found = True
+            x_obj, y_obj = int(x), int(y)
+
+            # Compute the 3 errors
+            ex = x_obj - cx           # horizontal error
+            ey = y_obj - cy           # vertical error
+            er = radius - target_radius  # depth error
+
+            # Compute commands
+            errors = [ex, ey, er]
+            commands = computePositionCommands(errors)
+            cmd_yaw, cmd_ud, cmd_fb = commands
+
+            # Clamp commands
+            cmd_yaw = clamp(cmd_yaw)
+            cmd_ud  = clamp(cmd_ud)
+            cmd_fb  = clamp(cmd_fb)
+
+            # Draw target overlay
+            cv2.circle(frame, (x_obj, y_obj), 5, color_info, 10)
+            cv2.circle(frame, (x_obj, y_obj), int(radius), color_info, 2)
+
+    cv2.putText(frame, f"klr={klr:.2f}, kud={kud:.2f}, kfb={kfb:.2f}", (10, 30),
+                cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.line(frame, (cx, 0), (cx, height), (255, 0, 0), 2)   # vertical blue axis
+    cv2.line(frame, (0, cy), (width, cy), (255, 0, 0), 2)    # horizontal blue axis
+
+    # Target radius circle
+    cv2.circle(frame, (cx, cy), target_radius, (255, 0, 0), 2)
+
+    if target_found:
+        cv2.putText(frame, f"ex={ex:+d}, ey={ey:+d}, er={er:+.0f}", (10, height - 80),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.putText(frame, f"Cmd: Yaw={cmd_yaw:+d}, UD={cmd_ud:+d}, FB={cmd_fb:+d}", (10, height - 50),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
+
+        cv2.putText(frame, f"r={int(radius)} px, pos=({x_obj},{y_obj})", (10, height - 20),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    if control_active:
+        cv2.putText(frame, "control active", (10, 70),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(frame, "press 'o' to enable control", (10, 70),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 0, 255), 1, cv2.LINE_AA)
+
+    cv2.putText(frame, f"Battery: {tello.get_battery()}%", (width - 250, 30),
+                cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 1, cv2.LINE_AA)
+
+    cv2.imshow(windowTitle, frame)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == 27:   # Escape: exit
+        break
+
+    if key == ord('t'):
+        tello.takeoff()
+        airborne = True
+        tello.send_rc_control(0, 0, 0, 0)
+
+    elif key == ord('l'):
+        control_active = False
+        tello.send_rc_control(0, 0, 0, 0)
+        tello.land()
+        airborne = False
+
+    if key == ord('o') and airborne:
+        control_active = not control_active
+        if control_active:
+            print("control active")
+            print(f"Gains: klr={klr:.2f}, kud={kud:.2f}, kfb={kfb:.2f}")
+        else:
+            tello.send_rc_control(0, 0, 0, 0)
+            print("control inactive")
+
+    if airborne:
+        if control_active and target_found:
+            # RC order: left/right, forward/backward, up/down, yaw
+            tello.send_rc_control(0, cmd_fb, cmd_ud, cmd_yaw)
+        elif not control_active:
+            # Manual mode
+            vx, vy, vz, yaw = 0, 0, 0, 0
+
+            if key == ord('z'):
+                vx = 100    # move forward
+            elif key == ord('s'):
+                vx = -100   # move backward
+
+            elif key == ord('a'):
+                vy = -100   # move left
+            elif key == ord('d'):
+                vy = 100    # move right
+
+            elif key == ord('e'):
+                yaw = 100   # rotate clockwise
+            elif key == ord('w'):
+                yaw = -100  # rotate counter-clockwise
+
+            elif key == ord('r'):
+                vz = 100    # move up
+            elif key == ord('f'):
+                vz = -100   # move down
+
+            tello.send_rc_control(vy, vx, vz, yaw)  # send commands to the drone
+        else:
+            # Control active but no target: stop
+            tello.send_rc_control(0, 0, 0, 0)
+
+
+tello.end()
+cv2.destroyAllWindows()
