@@ -1,0 +1,156 @@
+from djitellopy import Tello
+import cv2
+import numpy as np
+
+def mouse(event, x, y, flags, param):
+    global color, lo, hi
+    
+    # Left double-click: select color
+    if event == cv2.EVENT_LBUTTONDBLCLK:
+        color = image[y, x][0]
+    
+    # Scroll wheel: adjust hue
+    if event == cv2.EVENT_MOUSEWHEEL:
+        if flags < 0:
+            if color > 5:
+                color -= 1
+        else:
+            if color < 250:
+                color += 1
+    
+    # Update detection bounds
+    lo[0] = color - 5
+    hi[0] = color + 5
+
+# Drone initialization
+tello = Tello()
+tello.connect()
+tello.streamon()
+frame_read = tello.get_frame_read()
+
+# Global variables
+img = frame_read.frame
+height, width = img.shape[:2]
+color = 100
+lo = np.array([color - 5, 100, 50])
+hi = np.array([color + 5, 255, 255])
+color_info = (0, 255, 255)
+airborne = False
+
+Kp = 0.10  # initial proportional gain (adjustable with +/-)
+error = 0   # error between object position and center (computed in loop)
+command = 0 # correction command (computed in loop)
+
+# Compute image center
+center_x = width // 2
+center_y = height // 2
+
+# Create window and set mouse callback
+cv2.namedWindow('Camera')
+cv2.setMouseCallback('Camera', mouse)
+
+# Main loop
+while True:
+    # Frame acquisition
+    img = frame_read.frame
+    
+    # Color conversion and detection
+    image = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    image = cv2.blur(image, (5, 5))
+    mask = cv2.inRange(image, lo, hi)
+    mask = cv2.erode(mask, None, iterations=1)
+    mask = cv2.dilate(mask, None, iterations=1)
+    elements = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    
+    cv2.line(img, (center_x, 0), (center_x, height), (255, 0, 0), 2)
+    
+    cv2.putText(img, "Kp = {:.2f}".format(Kp),
+                (10, 40), cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    
+    # Battery level (bottom right)
+    cv2.putText(img, "Battery: {}%".format(tello.get_battery()),
+                (width - 250, height - 20), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+    
+    # Detected color
+    cv2.putText(img, "Color: {:d}".format(color),
+                (10, 80), cv2.FONT_HERSHEY_DUPLEX, 0.7, color_info, 1, cv2.LINE_AA)
+    
+    # Detected object processing
+    if len(elements) > 0:
+        c = max(elements, key=cv2.contourArea)
+        ((x, y), radius) = cv2.minEnclosingCircle(c)
+        
+        if radius > 30:
+            # Draw circle around the object
+            cv2.circle(img, (int(x), int(y)), int(radius), color_info, 2)
+            cv2.circle(img, (int(x), int(y)), 5, (0, 0, 255), -1)
+            
+            # Error = difference between object X position and image center
+            error = int(x) - center_x
+            
+            command = Kp * error
+            
+            cv2.putText(img, "Error = {:+d} px".format(error),
+                        (10, 120), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
+            
+            cv2.putText(img, "Command = {:.2f}".format(command),
+                        (10, 160), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
+            
+            # Display position and size
+            pos_x = int(x) - center_x
+            pos_y = center_y - int(y)
+            cv2.putText(img, "Position: ({:+d}, {:+d}) px".format(pos_x, pos_y),
+                        (10, height - 60), cv2.FONT_HERSHEY_DUPLEX, 0.6, color_info, 1, cv2.LINE_AA)
+            cv2.putText(img, "Size: {:.0f} px".format(radius),
+                        (10, height - 20), cv2.FONT_HERSHEY_DUPLEX, 0.6, color_info, 1, cv2.LINE_AA)
+    
+    # Keyboard handling
+    key = cv2.waitKey(1) & 0xFF
+    
+    if key == ord('q'):  # 'q': quit
+        if airborne:
+            tello.land()
+        break
+    
+    elif key == ord('+') or key == ord('='):  # '+': increase Kp
+        Kp += 0.01
+        print("Kp increased: {:.2f}".format(Kp))
+    
+    elif key == ord('-') or key == ord('_'):  # '-': decrease Kp
+        if Kp > 0.01:  # prevent negative values
+            Kp -= 0.01
+            print("Kp decreased: {:.2f}".format(Kp))
+    
+    if airborne:
+        if key == ord('z'):    # move forward
+            tello.send_rc_control(0, 50, 0, 0)
+        elif key == ord('s'):  # move backward
+            tello.send_rc_control(0, -50, 0, 0)
+        elif key == ord('d'):  # move right
+            tello.send_rc_control(50, 0, 0, 0)
+        elif key == ord('a'):  # move left
+            tello.send_rc_control(-50, 0, 0, 0)
+        elif key == ord('e'):  # rotate clockwise
+            tello.send_rc_control(0, 0, 0, 50)
+        elif key == ord('w'):  # rotate counter-clockwise
+            tello.send_rc_control(0, 0, 0, -50)
+        elif key == ord('c'):  # move up
+            tello.send_rc_control(0, 0, 50, 0)
+        elif key == ord('x'):  # move down
+            tello.send_rc_control(0, 0, -50, 0)
+        elif key == ord('t'):  # take off
+            tello.takeoff()
+            airborne = 1
+        elif key == ord('l'):  # land
+            tello.land()
+            airborne = 0
+        else:
+            tello.send_rc_control(0, 0, 0, 0)
+
+    # Display
+    cv2.imshow('Camera', img)
+
+# Cleanup
+tello.streamoff()
+cv2.destroyAllWindows()
+tello.end()
